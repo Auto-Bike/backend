@@ -1,99 +1,160 @@
-from fastapi import FastAPI,HTTPException, Depends
-from pydantic import BaseModel
-from mqtt_handler import MQTTHandler
-from fastapi.middleware.cors import CORSMiddleware
-from connection_tracker import connection_tracker, ConnectionTracker
-import config
-import redis
+from abc import ABC, abstractmethod
 import json
 import asyncio
+import redis
+import config
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-app = FastAPI()
-redis_client = redis.Redis(host="localhost", port=6379, db=0,decode_responses=True)
+# --- Interfaces for Abstraction (Interface Segregation & Dependency Inversion) ---
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (change to frontend domain in production)
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods (POST, GET, OPTIONS, etc.)
-    allow_headers=["*"],  # Allow all headers
-)
+class IMessagePublisher(ABC):
+    @abstractmethod
+    def publish(self, channel: str, message: str) -> int:
+        pass
 
-# Initialize MQTT handler
-# mqtt_handler = MQTTHandler(config.MQTT_BROKER, config.MQTT_PORT, config.MQTT_TOPIC_PREFIX)
+class IDataStore(ABC):
+    @abstractmethod
+    def get(self, key: str):
+        pass
+
+    @abstractmethod
+    def set(self, key: str, value, ex=None):
+        pass
+
+# --- Concrete Implementations using Redis (Single Responsibility) ---
+
+class RedisPublisher(IMessagePublisher):
+    def __init__(self, client: redis.Redis):
+        self.client = client
+
+    def publish(self, channel: str, message: str) -> int:
+        return self.client.publish(channel, message)
+
+class RedisDataStore(IDataStore):
+    def __init__(self, client: redis.Redis):
+        self.client = client
+
+    def get(self, key: str):
+        return self.client.get(key)
+
+    def set(self, key: str, value, ex=None):
+        self.client.set(key, value, ex=ex)
+
+# --- Pydantic Models for Request Validation (Separation of Concerns) ---
 
 class BikeCommand(BaseModel):
     command: str
     speed: int = 50  # Default speed is 50%
 
+class GPSData(BaseModel):
+    bike_id: str
+    latitude: float
+    longitude: float
+    timestamp: float
+
+# --- Bike Service with Business Logic (Single Responsibility) ---
+
+class BikeService:
+    def __init__(self, data_store: IDataStore, publisher: IMessagePublisher):
+        self.data_store = data_store
+        self.publisher = publisher
+
+    async def get_latest_gps(self, bike_id: str):
+        """Retrieve the latest GPS data for a bike."""
+        redis_key = f"gps:{bike_id}"
+        gps_data = self.data_store.get(redis_key)
+        if gps_data:
+            return json.loads(gps_data)
+        else:
+            raise HTTPException(status_code=404, detail="No GPS data found for this bike")
+
+    async def test_bike_connection(self, bike_id: str):
+        """Send a connection request and wait for the bike’s acknowledgment."""
+        message = {"topic": bike_id, "payload": {"command": "connect"}}
+        self.publisher.publish("mqtt_channel", json.dumps(message))
+        
+        redis_key = f"ack:{bike_id}"
+        self.data_store.set(redis_key, "waiting", ex=10)
+        
+        for _ in range(10):  # Retry for 10 seconds
+            ack_status = self.data_store.get(redis_key)
+            if ack_status == "acknowledged":
+                return {"status": "success", "message": f"Bike {bike_id} responded successfully"}
+            await asyncio.sleep(1)
+        
+        return {"status": "failed", "message": f"Bike {bike_id} did not respond"}
+
+    def handle_bike_response(self, bike_id: str):
+        """Handle acknowledgment received from the bike."""
+        redis_key = f"ack:{bike_id}"
+        self.data_store.set(redis_key, "acknowledged", ex=30)
+        return {"status": "success", "message": f"Bike {bike_id} acknowledged connection"}
+
+    def send_command(self, bike_id: str, command: BikeCommand):
+        """Validate and send a command to the bike."""
+        valid_commands = {"forward", "backward", "left", "right", "stop"}
+        if command.command not in valid_commands:
+            raise HTTPException(status_code=400, detail="Invalid command. Use 'forward', 'backward', 'left', 'right', or 'stop'.")
+        
+        message = {
+            "topic": bike_id,
+            "payload": {
+                "command": command.command,
+                "speed": command.speed,
+            }
+        }
+        published_count = self.publisher.publish("mqtt_channel", json.dumps(message))
+        if published_count > 0:
+            return {
+                "status": "sent",
+                "message": f"Command '{command.command}' sent to Bike {bike_id}",
+                "redis_receivers": published_count
+            }
+        else:
+            raise HTTPException(status_code=500, detail="No MQTT subscribers received the message.")
+
+# --- FastAPI Application Setup with Dependency Injection (Dependency Inversion) ---
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Redis client and inject dependencies into service classes.
+redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+data_store = RedisDataStore(redis_client)
+publisher = RedisPublisher(redis_client)
+bike_service = BikeService(data_store, publisher)
+
+# --- API Endpoints ---
+
+@app.get("/latest-gps/{bike_id}")
+async def get_latest_gps(bike_id: str):
+    return await bike_service.get_latest_gps(bike_id)
+
 @app.get("/test-bike-connection/{bike_id}")
-async def request_bike(bike_id: str):
-    """Sends an MQTT message and tracks acknowledgment in Redis."""
-    message = {"topic": f"{bike_id}", "payload": {"command": "connect"}}
-    redis_client.publish("mqtt_channel", json.dumps(message))  # Send to Redis queue
+async def test_bike_connection(bike_id: str):
+    return await bike_service.test_bike_connection(bike_id)
 
-    # Create event tracker in Redis
-    redis_key = f"ack:{bike_id}"
-    redis_client.set(redis_key, "waiting", ex=10)  # Set expiration (10s)
-
-    # Wait for bike acknowledgment
-    for _ in range(10):  # Retry for 10 seconds
-        ack_status = redis_client.get(redis_key)
-        if ack_status == "acknowledged":
-            return {"status": "success", "message": f"Bike {bike_id} responded successfully"}
-        await asyncio.sleep(1)  # Wait before retrying
-
-    return {"status": "failed", "message": f"Bike {bike_id} did not respond"}
-
-    
 @app.post("/bike-response")
 async def bike_response(bike_id: str):
-    """Receives an acknowledgment from the bike and updates Redis."""
-    redis_key = f"ack:{bike_id}"
-    redis_client.set(redis_key, "acknowledged", ex=30)  # Store acknowledgment
-
-    return {"status": "success", "message": f"Bike {bike_id} acknowledged connection"}
+    return bike_service.handle_bike_response(bike_id)
 
 @app.post("/send-command")
 async def send_command(command: BikeCommand):
-    """
-    Sends an MQTT command to the specified bike.
-    Example JSON request:
-    {
-        "command": "forward"
-    }
-    """
-    valid_commands = {"forward", "backward", "left", "right", "stop"}
-    
-    if command.command not in valid_commands:
-        raise HTTPException(status_code=400, detail="Invalid command. Use 'forward', 'backward', 'left', 'right', or 'stop'.")
-
-    message = {
-        "topic": f"{config.BIKE_ID}", 
-        "payload": {
-            "command": command.command,
-            "speed": command.speed,
-        }
-    }
-    published_count = redis_client.publish("mqtt_channel", json.dumps(message))  # Send to Redis queue
-
-    # mid = mqtt_handler.publish_message(config.BIKE_ID, message)
-
-    if published_count > 0:  # At least one subscriber received the message
-        return {
-            "status": "sent",
-            "message": f"Command '{command.command}' sent to Bike {config.BIKE_ID}",
-            "redis_receivers": published_count  # Add Redis return value
-        }
-    else:
-        raise HTTPException(status_code=500, detail="No MQTT subscribers received the message.")
-
-
+    # Here we use the bike id from config. You might extend this endpoint to accept a bike_id.
+    return bike_service.send_command(config.BIKE_ID, command)
 
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
-
 
 if __name__ == "__main__":
     import uvicorn
