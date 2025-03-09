@@ -14,6 +14,7 @@ class ConnectionTracker:
     async def wait_for_response(self, bike_id: str, timeout: int = 5):
         """Waits for the bike's response within the timeout period."""
         try:
+            #
             await asyncio.wait_for(self.pending_responses[bike_id].wait(), timeout=timeout)
             return {"status": "success", "message": f"Bike {bike_id} responded successfully"}
         except asyncio.TimeoutError:
