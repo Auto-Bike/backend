@@ -1,6 +1,7 @@
 import asyncio
 from typing import Dict
 
+
 class ConnectionTracker:
     """Tracks bike connection requests and responses."""
 
@@ -15,10 +16,18 @@ class ConnectionTracker:
         """Waits for the bike's response within the timeout period."""
         try:
             #
-            await asyncio.wait_for(self.pending_responses[bike_id].wait(), timeout=timeout)
-            return {"status": "success", "message": f"Bike {bike_id} responded successfully"}
+            await asyncio.wait_for(
+                self.pending_responses[bike_id].wait(), timeout=timeout
+            )
+            return {
+                "status": "success",
+                "message": f"Bike {bike_id} responded successfully",
+            }
         except asyncio.TimeoutError:
-            return {"status": "failed", "message": f"Bike {bike_id} did not respond within {timeout} seconds"}
+            return {
+                "status": "failed",
+                "message": f"Bike {bike_id} did not respond within {timeout} seconds",
+            }
         finally:
             self.pending_responses.pop(bike_id, None)  # Cleanup
 
@@ -28,6 +37,7 @@ class ConnectionTracker:
             self.pending_responses[bike_id].set()
             return True
         return False
+
 
 # Create a shared instance of ConnectionTracker
 connection_tracker = ConnectionTracker()
