@@ -2,11 +2,12 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 
-import config
 import redis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+import config
 
 # --- Interfaces for Abstraction (Interface Segregation & Dependency Inversion) ---
 
@@ -54,7 +55,8 @@ class RedisDataStore(IDataStore):
 
 class BikeCommand(BaseModel):
     command: str
-    speed: int = 50  # Default speed is 50%
+    speed: int = None
+    angle: int = None
 
 
 class GPSData(BaseModel):
@@ -62,6 +64,11 @@ class GPSData(BaseModel):
     latitude: float
     longitude: float
     timestamp: float
+
+
+class NavigateCommand(BaseModel):
+    start: dict  # e.g., {"lat": 43.65, "lon": -79.38}
+    destination: dict
 
 
 # --- Bike Service with Business Logic (Single Responsibility) ---
@@ -113,11 +120,11 @@ class BikeService:
 
     def send_command(self, bike_id: str, command: BikeCommand):
         """Validate and send a command to the bike."""
-        valid_commands = {"forward", "backward", "left", "right", "stop"}
+        valid_commands = {"forward", "backward", "left", "right", "stop", "center"}
         if command.command not in valid_commands:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid command. Use 'forward', 'backward', 'left', 'right', or 'stop'.",
+                detail="Invalid command. Use 'forward', 'backward', 'left', 'right', 'center', or 'stop'.",
             )
 
         message = {
@@ -125,6 +132,7 @@ class BikeService:
             "payload": {
                 "command": command.command,
                 "speed": command.speed,
+                "turning_angle": command.angle,
             },
         }
         published_count = self.publisher.publish("mqtt_channel", json.dumps(message))
@@ -132,6 +140,27 @@ class BikeService:
             return {
                 "status": "sent",
                 "message": f"Command '{command.command}' sent to Bike {bike_id}",
+                "redis_receivers": published_count,
+            }
+        else:
+            raise HTTPException(
+                status_code=500, detail="No MQTT subscribers received the message."
+            )
+
+    def send_navigation(self, bike_id: str, nav: NavigateCommand):
+        message = {
+            "topic": bike_id,
+            "payload": {
+                "command": "navigate",
+                "start": nav.start,
+                "destination": nav.destination,
+            },
+        }
+        published_count = self.publisher.publish("mqtt_channel", json.dumps(message))
+        if published_count > 0:
+            return {
+                "status": "sent",
+                "message": f"Navigation route sent to Bike {bike_id}",
                 "redis_receivers": published_count,
             }
         else:
@@ -180,6 +209,11 @@ async def bike_response(bike_id: str):
 async def send_command(command: BikeCommand):
     # Here we use the bike id from config. You might extend this endpoint to accept a bike_id.
     return bike_service.send_command(config.BIKE_ID, command)
+
+
+@app.post("/send-navigation")
+async def send_navigation(nav: NavigateCommand):
+    return bike_service.send_navigation(config.BIKE_ID, nav)
 
 
 @app.get("/")
